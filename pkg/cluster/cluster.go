@@ -3,9 +3,11 @@ package cluster
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/pkg/errors"
 	"io"
 	"io/ioutil"
 	"os"
+	exec2 "os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -153,6 +155,47 @@ mkdir $sshdir; chmod 700 $sshdir
 touch $sshdir/authorized_keys; chmod 600 $sshdir/authorized_keys
 `
 
+func executeCommand(command string, args ...string) (string, error) {
+	cmd := exec2.Command(command, args...)
+	out, err := cmd.CombinedOutput()
+	cmdArgs := strings.Join(cmd.Args, " ")
+	//log.Debugf("Command %q returned %q\n", cmdArgs, out)
+	if err != nil {
+		return "", errors.Wrapf(err, "command %q exited with %q", cmdArgs, out)
+	}
+
+	// TODO: strings.Builder?
+	return strings.TrimSpace(string(out)), nil
+}
+
+func execForeground(command string, args ...string) (int, error) {
+	cmd := exec2.Command(command, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	cmdArgs := strings.Join(cmd.Args, " ")
+
+	var cmdErr error
+	var exitCode int
+
+	if err != nil {
+		cmdErr = fmt.Errorf("external command %q exited with an error: %v", cmdArgs, err)
+
+		if exitError, ok := err.(*exec2.ExitError); ok {
+			exitCode = exitError.ExitCode()
+		} else {
+			cmdErr = fmt.Errorf("failed to get exit code for external command %q", cmdArgs)
+		}
+	}
+
+	return exitCode, cmdErr
+}
+
+func vmName(c *Cluster, m *Machine) string {
+	return fmt.Sprintf("footloose-cluster-%s-node-%s", c.spec.Cluster.Name, m.name)
+}
+
 func (c *Cluster) publicKey() ([]byte, error) {
 	path, _ := homedir.Expand(c.spec.Cluster.PrivateKey)
 	return ioutil.ReadFile(path + ".pub")
@@ -174,44 +217,55 @@ func (c *Cluster) createMachine(machine *Machine, i int) error {
 		cmd = machine.spec.Cmd
 	}
 
-	runArgs := c.createMachineRunArgs(machine, name, i)
-	_, err := docker.Create(machine.spec.Image,
-		runArgs,
-		[]string{cmd},
-	)
-	if err != nil {
-		return err
-	}
+	if machine.spec.Backend == "ignite" {
+		n := vmName(c, machine)
+		if _, err := executeCommand("ignite", "build", machine.spec.Image, "--name", n); err != nil {
+			return err
+		}
 
-	// We connect the first network in with the run command, connect the remaining
-	// ones.
-	// TODO(damien): Split run into create+start so we can connect all networks
-	// before the container is started.
-	if len(machine.spec.Networks) > 1 {
-		for _, network := range machine.spec.Networks[1:] {
-			log.Infof("Connecting %s to the %s network...", name, network)
-			if network == "bridge" {
-				docker.ConnectNetwork(name, network)
-			} else {
-				docker.ConnectNetworkWithAlias(name, network, machine.Hostname())
+		if _, err := executeCommand("ignite", "run", n, "amazon", "--name", n); err != nil {
+			return err
+		}
+	} else {
+		runArgs := c.createMachineRunArgs(machine, name, i)
+		_, err := docker.Create(machine.spec.Image,
+			runArgs,
+			[]string{cmd},
+		)
+		if err != nil {
+			return err
+		}
+
+		// We connect the first network in with the run command, connect the remaining
+		// ones.
+		// TODO(damien): Split run into create+start so we can connect all networks
+		// before the container is started.
+		if len(machine.spec.Networks) > 1 {
+			for _, network := range machine.spec.Networks[1:] {
+				log.Infof("Connecting %s to the %s network...", name, network)
+				if network == "bridge" {
+					docker.ConnectNetwork(name, network)
+				} else {
+					docker.ConnectNetworkWithAlias(name, network, machine.Hostname())
+				}
 			}
 		}
-	}
 
-	if err := docker.Start(name); err != nil {
-		return err
-	}
+		if err := docker.Start(name); err != nil {
+			return err
+		}
 
-	// Initial provisioning.
-	if err := containerRunShell(name, initScript); err != nil {
-		return err
-	}
-	publicKey, err := c.publicKey()
-	if err != nil {
-		return err
-	}
-	if err := copy(name, publicKey, "/root/.ssh/authorized_keys"); err != nil {
-		return err
+		// Initial provisioning.
+		if err := containerRunShell(name, initScript); err != nil {
+			return err
+		}
+		publicKey, err := c.publicKey()
+		if err != nil {
+			return err
+		}
+		if err := copy(name, publicKey, "/root/.ssh/authorized_keys"); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -565,42 +619,51 @@ func (c *Cluster) SSH(nodename string, username string, remoteArgs ...string) er
 	if err != nil {
 		return err
 	}
-	hostPort, err := machine.HostPort(22)
-	if err != nil {
-		return err
-	}
-	mapping, err := mappingFromPort(machine.spec, 22)
-	if err != nil {
-		return err
-	}
-	remote := "localhost"
-	if mapping.Address != "" {
-		remote = mapping.Address
-	}
-	path, _ := homedir.Expand(c.spec.Cluster.PrivateKey)
-	args := []string{
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "IdentitiesOnly=yes",
-		"-i", path,
-		"-p", f("%d", hostPort),
-		"-l", username,
-		remote,
-	}
-	args = append(args, remoteArgs...)
-	// If we ssh in a bit too quickly after the container creation, ssh errors out
-	// with:
-	//   ssh_exchange_identification: read: Connection reset by peer
-	// Let's loop a few times if we receive this message.
-	retries := 25
-	var retry bool
-	for retries > 0 {
-		retry, err = ssh(args)
-		if !retry {
-			break
+
+	if machine.spec.Backend == "ignite" {
+		n := vmName(c, machine)
+		if _, err := execForeground("ignite", "attach", n); err != nil {
+			return err
 		}
-		retries--
-		time.Sleep(200 * time.Millisecond)
+	} else {
+		hostPort, err := machine.HostPort(22)
+		if err != nil {
+			return err
+		}
+		mapping, err := mappingFromPort(machine.spec, 22)
+		if err != nil {
+			return err
+		}
+		remote := "localhost"
+		if mapping.Address != "" {
+			remote = mapping.Address
+		}
+		path, _ := homedir.Expand(c.spec.Cluster.PrivateKey)
+		args := []string{
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "IdentitiesOnly=yes",
+			"-i", path,
+			"-p", f("%d", hostPort),
+			"-l", username,
+			remote,
+		}
+		args = append(args, remoteArgs...)
+		// If we ssh in a bit too quickly after the container creation, ssh errors out
+		// with:
+		//   ssh_exchange_identification: read: Connection reset by peer
+		// Let's loop a few times if we receive this message.
+		retries := 25
+		var retry bool
+		for retries > 0 {
+			retry, err = ssh(args)
+			if !retry {
+				break
+			}
+			retries--
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
+
 	return err
 }

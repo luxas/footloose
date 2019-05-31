@@ -61,6 +61,8 @@ type Machine struct {
 	PortMappings []PortMapping `json:"portMappings,omitempty"`
 	// Cmd is a cmd which will be run in the container.
 	Cmd string `json:"cmd,omitempty"`
+	// Backend specifies the runtime backend for this machine
+	Backend string
 }
 
 // validate checks basic rules for Machine's fields
