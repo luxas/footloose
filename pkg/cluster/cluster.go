@@ -193,7 +193,7 @@ func execForeground(command string, args ...string) (int, error) {
 }
 
 func vmName(c *Cluster, m *Machine) string {
-	return fmt.Sprintf("footloose-cluster-%s-node-%s", c.spec.Cluster.Name, m.name)
+	return fmt.Sprintf("footloose-%s-%s", c.spec.Cluster.Name, m.name)
 }
 
 func (c *Cluster) publicKey() ([]byte, error) {
