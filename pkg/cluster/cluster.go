@@ -1,6 +1,9 @@
 package cluster
 
 import (
+	"path/filepath"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"github.com/pkg/errors"
@@ -192,10 +195,6 @@ func execForeground(command string, args ...string) (int, error) {
 	return exitCode, cmdErr
 }
 
-func vmName(c *Cluster, m *Machine) string {
-	return fmt.Sprintf("footloose-%s-%s", c.spec.Cluster.Name, m.name)
-}
-
 func (c *Cluster) publicKey() ([]byte, error) {
 	path, _ := homedir.Expand(c.spec.Cluster.PrivateKey)
 	return ioutil.ReadFile(path + ".pub")
@@ -203,6 +202,11 @@ func (c *Cluster) publicKey() ([]byte, error) {
 
 func (c *Cluster) createMachine(machine *Machine, i int) error {
 	name := machine.ContainerName()
+
+	publicKey, err := c.publicKey()
+	if err != nil {
+		return err
+	}
 
 	// Start the container.
 	log.Infof("Creating machine: %s ...", name)
@@ -218,12 +222,49 @@ func (c *Cluster) createMachine(machine *Machine, i int) error {
 	}
 
 	if machine.spec.Backend == "ignite" {
-		n := vmName(c, machine)
-		if _, err := executeCommand("ignite", "build", machine.spec.Image, "--name", n); err != nil {
+		// Get the hash of the public key in order to build a new image each time it may change
+		sha := sha256.New()
+		sha.Write(publicKey)
+		hash := hex.EncodeToString(sha.Sum(nil))
+
+		imgName := "footloose-" + strings.ReplaceAll(machine.spec.Image, "/", "-") + "-" + hash[:8]
+		imgName = strings.ReplaceAll(imgName, ":", "-")
+
+		output, err := executeCommand("ignite", "images")
+		if err != nil {
 			return err
 		}
 
-		if _, err := executeCommand("ignite", "run", n, "amazon", "--name", n); err != nil {
+		if !strings.Contains(output, imgName) {
+			pubKeyPath := c.spec.Cluster.PrivateKey+".pub"
+			if !filepath.IsAbs(pubKeyPath) {
+				wd, err := os.Getwd()
+				if err != nil {
+					return err
+				}
+				pubKeyPath = filepath.Join(wd, pubKeyPath)
+			}
+			copyFilesArg := fmt.Sprintf("--copy-files=%s:/root/.ssh/authorized_keys", pubKeyPath)
+			if _, err := executeCommand("ignite", "build", machine.spec.Image, "--name="+imgName, copyFilesArg); err != nil {
+				return err
+			}
+		}
+		runArgs := []string{
+			"run", 
+			imgName, 
+			"amazon", 
+			"--name="+machine.name,
+		}
+
+		for _, mapping := range machine.spec.PortMappings {
+			if mapping.HostPort == 0 {
+				// TODO: should warn here as containerPort is dropped
+				continue
+			}
+			runArgs = append(runArgs, fmt.Sprintf("-p=%d:%d", int(mapping.HostPort)+i, mapping.ContainerPort))
+		}
+
+		if _, err := executeCommand("ignite", runArgs...); err != nil {
 			return err
 		}
 	} else {
@@ -257,10 +298,6 @@ func (c *Cluster) createMachine(machine *Machine, i int) error {
 
 		// Initial provisioning.
 		if err := containerRunShell(name, initScript); err != nil {
-			return err
-		}
-		publicKey, err := c.publicKey()
-		if err != nil {
 			return err
 		}
 		if err := copy(name, publicKey, "/root/.ssh/authorized_keys"); err != nil {
@@ -620,49 +657,42 @@ func (c *Cluster) SSH(nodename string, username string, remoteArgs ...string) er
 		return err
 	}
 
-	if machine.spec.Backend == "ignite" {
-		n := vmName(c, machine)
-		if _, err := execForeground("ignite", "attach", n); err != nil {
-			return err
+	hostPort, err := machine.HostPort(22)
+	if err != nil {
+		return err
+	}
+	mapping, err := mappingFromPort(machine.spec, 22)
+	if err != nil {
+		return err
+	}
+	remote := "localhost"
+	if mapping.Address != "" {
+		remote = mapping.Address
+	}
+	path, _ := homedir.Expand(c.spec.Cluster.PrivateKey)
+	args := []string{
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "IdentitiesOnly=yes",
+		"-i", path,
+		"-p", f("%d", hostPort),
+		"-l", username,
+		remote,
+	}
+	args = append(args, remoteArgs...)
+	// If we ssh in a bit too quickly after the container creation, ssh errors out
+	// with:
+	//   ssh_exchange_identification: read: Connection reset by peer
+	// Let's loop a few times if we receive this message.
+	retries := 25
+	var retry bool
+	for retries > 0 {
+		retry, err = ssh(args)
+		if !retry {
+			break
 		}
-	} else {
-		hostPort, err := machine.HostPort(22)
-		if err != nil {
-			return err
-		}
-		mapping, err := mappingFromPort(machine.spec, 22)
-		if err != nil {
-			return err
-		}
-		remote := "localhost"
-		if mapping.Address != "" {
-			remote = mapping.Address
-		}
-		path, _ := homedir.Expand(c.spec.Cluster.PrivateKey)
-		args := []string{
-			"-o", "UserKnownHostsFile=/dev/null",
-			"-o", "StrictHostKeyChecking=no",
-			"-o", "IdentitiesOnly=yes",
-			"-i", path,
-			"-p", f("%d", hostPort),
-			"-l", username,
-			remote,
-		}
-		args = append(args, remoteArgs...)
-		// If we ssh in a bit too quickly after the container creation, ssh errors out
-		// with:
-		//   ssh_exchange_identification: read: Connection reset by peer
-		// Let's loop a few times if we receive this message.
-		retries := 25
-		var retry bool
-		for retries > 0 {
-			retry, err = ssh(args)
-			if !retry {
-				break
-			}
-			retries--
-			time.Sleep(200 * time.Millisecond)
-		}
+		retries--
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	return err
