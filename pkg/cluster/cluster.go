@@ -195,6 +195,29 @@ func execForeground(command string, args ...string) (int, error) {
 	return exitCode, cmdErr
 }
 
+func igniteImageExists(name string) (bool, error) {
+	output, err := executeCommand("ignite", "images")
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(output, name), nil
+}
+
+func (c *Cluster) igniteImageName(dockerImgName string) (string, error) {
+	publicKey, err := c.publicKey()
+	if err != nil {
+		return "", err
+	}
+
+	// Get the hash of the public key in order to build a new image each time it may change
+	sha := sha256.New()
+	sha.Write(publicKey)
+	hash := hex.EncodeToString(sha.Sum(nil))
+
+	imgName := "footloose-" + strings.ReplaceAll(dockerImgName, "/", "-") + "-" + hash[:8]
+	return strings.ReplaceAll(imgName, ":", "-"), nil
+}
+
 func (c *Cluster) publicKey() ([]byte, error) {
 	path, _ := homedir.Expand(c.spec.Cluster.PrivateKey)
 	return ioutil.ReadFile(path + ".pub")
@@ -222,38 +245,16 @@ func (c *Cluster) createMachine(machine *Machine, i int) error {
 	}
 
 	if machine.spec.Backend == "ignite" {
-		// Get the hash of the public key in order to build a new image each time it may change
-		sha := sha256.New()
-		sha.Write(publicKey)
-		hash := hex.EncodeToString(sha.Sum(nil))
-
-		imgName := "footloose-" + strings.ReplaceAll(machine.spec.Image, "/", "-") + "-" + hash[:8]
-		imgName = strings.ReplaceAll(imgName, ":", "-")
-
-		output, err := executeCommand("ignite", "images")
+		imgName, err := c.igniteImageName(machine.spec.Image)
 		if err != nil {
 			return err
 		}
 
-		if !strings.Contains(output, imgName) {
-			pubKeyPath := c.spec.Cluster.PrivateKey+".pub"
-			if !filepath.IsAbs(pubKeyPath) {
-				wd, err := os.Getwd()
-				if err != nil {
-					return err
-				}
-				pubKeyPath = filepath.Join(wd, pubKeyPath)
-			}
-			copyFilesArg := fmt.Sprintf("--copy-files=%s:/root/.ssh/authorized_keys", pubKeyPath)
-			if _, err := executeCommand("ignite", "build", machine.spec.Image, "--name="+imgName, copyFilesArg); err != nil {
-				return err
-			}
-		}
 		runArgs := []string{
-			"run", 
-			imgName, 
-			"amazon", 
-			"--name="+machine.name,
+			"run",
+			imgName,
+			imgName,
+			fmt.Sprintf("--name=%s", machine.name),
 		}
 
 		for _, mapping := range machine.spec.PortMappings {
@@ -372,6 +373,40 @@ func (c *Cluster) Create() error {
 	for _, template := range c.spec.Machines {
 		if _, err := docker.PullIfNotPresent(template.Spec.Image, 2); err != nil {
 			return err
+		}
+		if template.Spec.Backend != "ignite" {
+			continue
+		}
+
+		imgName, err := c.igniteImageName(template.Spec.Image)
+		if err != nil {
+			return err
+		}
+
+		exists, err := igniteImageExists(imgName)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			log.Infof("Building Ignite image %q from container image %q", imgName, template.Spec.Image)
+			pubKeyPath := c.spec.Cluster.PrivateKey+".pub"
+			if !filepath.IsAbs(pubKeyPath) {
+				wd, err := os.Getwd()
+				if err != nil {
+					return err
+				}
+				pubKeyPath = filepath.Join(wd, pubKeyPath)
+			}
+			buildArgs := []string{
+				"build",
+				template.Spec.Image,
+				fmt.Sprintf("--name=%s", imgName),
+				fmt.Sprintf("--import-kernel=%s", imgName),
+				fmt.Sprintf("--copy-files=%s:/root/.ssh/authorized_keys", pubKeyPath),
+			}
+			if _, err := executeCommand("ignite", buildArgs...); err != nil {
+				return err
+			}
 		}
 	}
 	return c.forEachMachine(c.createMachine)
