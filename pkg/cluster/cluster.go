@@ -2,8 +2,6 @@ package cluster
 
 import (
 	"path/filepath"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"github.com/pkg/errors"
@@ -39,8 +37,7 @@ type Cluster struct {
 // New creates a new cluster. It takes as input the description of the cluster
 // and its machines.
 func New(conf config.Config) (*Cluster, error) {
-	err := conf.Validate()
-	if err != nil {
+	if err := conf.Validate(); err != nil {
 		return nil, err
 	}
 	return &Cluster{
@@ -203,18 +200,8 @@ func igniteImageExists(name string) (bool, error) {
 	return strings.Contains(output, name), nil
 }
 
-func (c *Cluster) igniteImageName(dockerImgName string) (string, error) {
-	publicKey, err := c.publicKey()
-	if err != nil {
-		return "", err
-	}
-
-	// Get the hash of the public key in order to build a new image each time it may change
-	sha := sha256.New()
-	sha.Write(publicKey)
-	hash := hex.EncodeToString(sha.Sum(nil))
-
-	imgName := "footloose-" + strings.ReplaceAll(dockerImgName, "/", "-") + "-" + hash[:8]
+func igniteImageName(dockerImgName string) (string, error) {
+	imgName := "footloose-" + strings.ReplaceAll(dockerImgName, "/", "-")
 	return strings.ReplaceAll(imgName, ":", "-"), nil
 }
 
@@ -245,16 +232,34 @@ func (c *Cluster) createMachine(machine *Machine, i int) error {
 	}
 
 	if machine.spec.Backend == "ignite" {
-		imgName, err := c.igniteImageName(machine.spec.Image)
+		imgName, err := igniteImageName(machine.spec.Image)
 		if err != nil {
 			return err
+		}
+
+		pubKeyPath := c.spec.Cluster.PrivateKey+".pub"
+		if !filepath.IsAbs(pubKeyPath) {
+			wd, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			pubKeyPath = filepath.Join(wd, pubKeyPath)
+		}
+
+		kernelName := machine.spec.IgniteConfig().Kernel
+		if len(kernelName) == 0 {
+			kernelName = imgName
 		}
 
 		runArgs := []string{
 			"run",
 			imgName,
-			imgName,
+			kernelName,
 			fmt.Sprintf("--name=%s", machine.name),
+			fmt.Sprintf("--cpus=%d", machine.spec.IgniteConfig().CPUs),
+			fmt.Sprintf("--memory=%d", machine.spec.IgniteConfig().Memory),
+			fmt.Sprintf("--size=%s", machine.spec.IgniteConfig().Disk),	
+			fmt.Sprintf("--copy-files=%s:/root/.ssh/authorized_keys", pubKeyPath),
 		}
 
 		for _, mapping := range machine.spec.PortMappings {
@@ -262,7 +267,7 @@ func (c *Cluster) createMachine(machine *Machine, i int) error {
 				// TODO: should warn here as containerPort is dropped
 				continue
 			}
-			runArgs = append(runArgs, fmt.Sprintf("-p=%d:%d", int(mapping.HostPort)+i, mapping.ContainerPort))
+			runArgs = append(runArgs, fmt.Sprintf("--ports=%d:%d", int(mapping.HostPort)+i, mapping.ContainerPort))
 		}
 
 		if _, err := executeCommand("ignite", runArgs...); err != nil {
@@ -378,7 +383,7 @@ func (c *Cluster) Create() error {
 			continue
 		}
 
-		imgName, err := c.igniteImageName(template.Spec.Image)
+		imgName, err := igniteImageName(template.Spec.Image)
 		if err != nil {
 			return err
 		}
@@ -389,20 +394,15 @@ func (c *Cluster) Create() error {
 		}
 		if !exists {
 			log.Infof("Building Ignite image %q from container image %q", imgName, template.Spec.Image)
-			pubKeyPath := c.spec.Cluster.PrivateKey+".pub"
-			if !filepath.IsAbs(pubKeyPath) {
-				wd, err := os.Getwd()
-				if err != nil {
-					return err
-				}
-				pubKeyPath = filepath.Join(wd, pubKeyPath)
-			}
 			buildArgs := []string{
 				"build",
 				template.Spec.Image,
 				fmt.Sprintf("--name=%s", imgName),
-				fmt.Sprintf("--import-kernel=%s", imgName),
-				fmt.Sprintf("--copy-files=%s:/root/.ssh/authorized_keys", pubKeyPath),
+			}
+			// If an existing kernel wasn't specified, try to import one
+			existingKernelName := template.Spec.IgniteConfig().Kernel
+			if len(existingKernelName) == 0 {
+				buildArgs = append(buildArgs, fmt.Sprintf("--import-kernel=%s", imgName))
 			}
 			if _, err := executeCommand("ignite", buildArgs...); err != nil {
 				return err
