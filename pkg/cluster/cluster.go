@@ -1,11 +1,14 @@
 package cluster
 
 import (
+	"path/filepath"
 	"encoding/json"
 	"fmt"
+	"github.com/pkg/errors"
 	"io"
 	"io/ioutil"
 	"os"
+	exec2 "os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,8 +37,7 @@ type Cluster struct {
 // New creates a new cluster. It takes as input the description of the cluster
 // and its machines.
 func New(conf config.Config) (*Cluster, error) {
-	err := conf.Validate()
-	if err != nil {
+	if err := conf.Validate(); err != nil {
 		return nil, err
 	}
 	return &Cluster{
@@ -153,6 +155,56 @@ mkdir $sshdir; chmod 700 $sshdir
 touch $sshdir/authorized_keys; chmod 600 $sshdir/authorized_keys
 `
 
+func executeCommand(command string, args ...string) (string, error) {
+	cmd := exec2.Command(command, args...)
+	out, err := cmd.CombinedOutput()
+	cmdArgs := strings.Join(cmd.Args, " ")
+	//log.Debugf("Command %q returned %q\n", cmdArgs, out)
+	if err != nil {
+		return "", errors.Wrapf(err, "command %q exited with %q", cmdArgs, out)
+	}
+
+	// TODO: strings.Builder?
+	return strings.TrimSpace(string(out)), nil
+}
+
+func execForeground(command string, args ...string) (int, error) {
+	cmd := exec2.Command(command, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	cmdArgs := strings.Join(cmd.Args, " ")
+
+	var cmdErr error
+	var exitCode int
+
+	if err != nil {
+		cmdErr = fmt.Errorf("external command %q exited with an error: %v", cmdArgs, err)
+
+		if exitError, ok := err.(*exec2.ExitError); ok {
+			exitCode = exitError.ExitCode()
+		} else {
+			cmdErr = fmt.Errorf("failed to get exit code for external command %q", cmdArgs)
+		}
+	}
+
+	return exitCode, cmdErr
+}
+
+func igniteImageExists(name string) (bool, error) {
+	output, err := executeCommand("ignite", "images")
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(output, name), nil
+}
+
+func igniteImageName(dockerImgName string) (string, error) {
+	imgName := "footloose-" + strings.ReplaceAll(dockerImgName, "/", "-")
+	return strings.ReplaceAll(imgName, ":", "-"), nil
+}
+
 func (c *Cluster) publicKey() ([]byte, error) {
 	path, _ := homedir.Expand(c.spec.Cluster.PrivateKey)
 	return ioutil.ReadFile(path + ".pub")
@@ -160,6 +212,11 @@ func (c *Cluster) publicKey() ([]byte, error) {
 
 func (c *Cluster) createMachine(machine *Machine, i int) error {
 	name := machine.ContainerName()
+
+	publicKey, err := c.publicKey()
+	if err != nil {
+		return err
+	}
 
 	// Start the container.
 	log.Infof("Creating machine: %s ...", name)
@@ -174,44 +231,84 @@ func (c *Cluster) createMachine(machine *Machine, i int) error {
 		cmd = machine.spec.Cmd
 	}
 
-	runArgs := c.createMachineRunArgs(machine, name, i)
-	_, err := docker.Create(machine.spec.Image,
-		runArgs,
-		[]string{cmd},
-	)
-	if err != nil {
-		return err
-	}
+	if machine.spec.Backend == "ignite" {
+		imgName, err := igniteImageName(machine.spec.Image)
+		if err != nil {
+			return err
+		}
 
-	// We connect the first network in with the run command, connect the remaining
-	// ones.
-	// TODO(damien): Split run into create+start so we can connect all networks
-	// before the container is started.
-	if len(machine.spec.Networks) > 1 {
-		for _, network := range machine.spec.Networks[1:] {
-			log.Infof("Connecting %s to the %s network...", name, network)
-			if network == "bridge" {
-				docker.ConnectNetwork(name, network)
-			} else {
-				docker.ConnectNetworkWithAlias(name, network, machine.Hostname())
+		pubKeyPath := c.spec.Cluster.PrivateKey+".pub"
+		if !filepath.IsAbs(pubKeyPath) {
+			wd, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			pubKeyPath = filepath.Join(wd, pubKeyPath)
+		}
+
+		kernelName := machine.spec.IgniteConfig().Kernel
+		if len(kernelName) == 0 {
+			kernelName = imgName
+		}
+
+		runArgs := []string{
+			"run",
+			imgName,
+			kernelName,
+			fmt.Sprintf("--name=%s", machine.name),
+			fmt.Sprintf("--cpus=%d", machine.spec.IgniteConfig().CPUs),
+			fmt.Sprintf("--memory=%d", machine.spec.IgniteConfig().Memory),
+			fmt.Sprintf("--size=%s", machine.spec.IgniteConfig().Disk),	
+			fmt.Sprintf("--copy-files=%s:/root/.ssh/authorized_keys", pubKeyPath),
+		}
+
+		for _, mapping := range machine.spec.PortMappings {
+			if mapping.HostPort == 0 {
+				// TODO: should warn here as containerPort is dropped
+				continue
+			}
+			runArgs = append(runArgs, fmt.Sprintf("--ports=%d:%d", int(mapping.HostPort)+i, mapping.ContainerPort))
+		}
+
+		if _, err := executeCommand("ignite", runArgs...); err != nil {
+			return err
+		}
+	} else {
+		runArgs := c.createMachineRunArgs(machine, name, i)
+		_, err := docker.Create(machine.spec.Image,
+			runArgs,
+			[]string{cmd},
+		)
+		if err != nil {
+			return err
+		}
+
+		// We connect the first network in with the run command, connect the remaining
+		// ones.
+		// TODO(damien): Split run into create+start so we can connect all networks
+		// before the container is started.
+		if len(machine.spec.Networks) > 1 {
+			for _, network := range machine.spec.Networks[1:] {
+				log.Infof("Connecting %s to the %s network...", name, network)
+				if network == "bridge" {
+					docker.ConnectNetwork(name, network)
+				} else {
+					docker.ConnectNetworkWithAlias(name, network, machine.Hostname())
+				}
 			}
 		}
-	}
 
-	if err := docker.Start(name); err != nil {
-		return err
-	}
+		if err := docker.Start(name); err != nil {
+			return err
+		}
 
-	// Initial provisioning.
-	if err := containerRunShell(name, initScript); err != nil {
-		return err
-	}
-	publicKey, err := c.publicKey()
-	if err != nil {
-		return err
-	}
-	if err := copy(name, publicKey, "/root/.ssh/authorized_keys"); err != nil {
-		return err
+		// Initial provisioning.
+		if err := containerRunShell(name, initScript); err != nil {
+			return err
+		}
+		if err := copy(name, publicKey, "/root/.ssh/authorized_keys"); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -281,6 +378,35 @@ func (c *Cluster) Create() error {
 	for _, template := range c.spec.Machines {
 		if _, err := docker.PullIfNotPresent(template.Spec.Image, 2); err != nil {
 			return err
+		}
+		if template.Spec.Backend != "ignite" {
+			continue
+		}
+
+		imgName, err := igniteImageName(template.Spec.Image)
+		if err != nil {
+			return err
+		}
+
+		exists, err := igniteImageExists(imgName)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			log.Infof("Building Ignite image %q from container image %q", imgName, template.Spec.Image)
+			buildArgs := []string{
+				"build",
+				template.Spec.Image,
+				fmt.Sprintf("--name=%s", imgName),
+			}
+			// If an existing kernel wasn't specified, try to import one
+			existingKernelName := template.Spec.IgniteConfig().Kernel
+			if len(existingKernelName) == 0 {
+				buildArgs = append(buildArgs, fmt.Sprintf("--import-kernel=%s", imgName))
+			}
+			if _, err := executeCommand("ignite", buildArgs...); err != nil {
+				return err
+			}
 		}
 	}
 	return c.forEachMachine(c.createMachine)
@@ -565,6 +691,7 @@ func (c *Cluster) SSH(nodename string, username string, remoteArgs ...string) er
 	if err != nil {
 		return err
 	}
+
 	hostPort, err := machine.HostPort(22)
 	if err != nil {
 		return err
@@ -602,5 +729,6 @@ func (c *Cluster) SSH(nodename string, username string, remoteArgs ...string) er
 		retries--
 		time.Sleep(200 * time.Millisecond)
 	}
+
 	return err
 }
