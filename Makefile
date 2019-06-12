@@ -7,6 +7,9 @@ binary:
 		make footloose && \
 		chown ${UID_GID} bin/footloose"
 
+install: binary
+	sudo cp bin/footloose /usr/local/bin/
+
 footloose: bin/footloose
 bin/footloose:
 	CGO_ENABLED=0 go build -mod=vendor -o bin/footloose .

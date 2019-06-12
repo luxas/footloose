@@ -1,18 +1,19 @@
 package cluster
 
 import (
-	"path/filepath"
 	"encoding/json"
 	"fmt"
-	"github.com/pkg/errors"
 	"io"
 	"io/ioutil"
 	"os"
 	exec2 "os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/pkg/errors"
 
 	"github.com/docker/docker/api/types"
 	"github.com/ghodss/yaml"
@@ -232,12 +233,7 @@ func (c *Cluster) createMachine(machine *Machine, i int) error {
 	}
 
 	if machine.spec.Backend == "ignite" {
-		imgName, err := igniteImageName(machine.spec.Image)
-		if err != nil {
-			return err
-		}
-
-		pubKeyPath := c.spec.Cluster.PrivateKey+".pub"
+		pubKeyPath := c.spec.Cluster.PrivateKey + ".pub"
 		if !filepath.IsAbs(pubKeyPath) {
 			wd, err := os.Getwd()
 			if err != nil {
@@ -246,19 +242,19 @@ func (c *Cluster) createMachine(machine *Machine, i int) error {
 			pubKeyPath = filepath.Join(wd, pubKeyPath)
 		}
 
+		/* TODO: custom kernel support
 		kernelName := machine.spec.IgniteConfig().Kernel
 		if len(kernelName) == 0 {
 			kernelName = imgName
-		}
+		}*/
 
 		runArgs := []string{
 			"run",
-			imgName,
-			kernelName,
+			machine.spec.Image,
 			fmt.Sprintf("--name=%s", machine.name),
 			fmt.Sprintf("--cpus=%d", machine.spec.IgniteConfig().CPUs),
 			fmt.Sprintf("--memory=%d", machine.spec.IgniteConfig().Memory),
-			fmt.Sprintf("--size=%s", machine.spec.IgniteConfig().Disk),	
+			fmt.Sprintf("--size=%s", machine.spec.IgniteConfig().Disk),
 			fmt.Sprintf("--copy-files=%s:/root/.ssh/authorized_keys", pubKeyPath),
 		}
 
@@ -378,35 +374,6 @@ func (c *Cluster) Create() error {
 	for _, template := range c.spec.Machines {
 		if _, err := docker.PullIfNotPresent(template.Spec.Image, 2); err != nil {
 			return err
-		}
-		if template.Spec.Backend != "ignite" {
-			continue
-		}
-
-		imgName, err := igniteImageName(template.Spec.Image)
-		if err != nil {
-			return err
-		}
-
-		exists, err := igniteImageExists(imgName)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			log.Infof("Building Ignite image %q from container image %q", imgName, template.Spec.Image)
-			buildArgs := []string{
-				"build",
-				template.Spec.Image,
-				fmt.Sprintf("--name=%s", imgName),
-			}
-			// If an existing kernel wasn't specified, try to import one
-			existingKernelName := template.Spec.IgniteConfig().Kernel
-			if len(existingKernelName) == 0 {
-				buildArgs = append(buildArgs, fmt.Sprintf("--import-kernel=%s", imgName))
-			}
-			if _, err := executeCommand("ignite", buildArgs...); err != nil {
-				return err
-			}
 		}
 	}
 	return c.forEachMachine(c.createMachine)

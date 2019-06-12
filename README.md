@@ -222,6 +222,10 @@ Failed to install release agent, ignoring: File exists
 [  OK  ] Reached target Multi-User System.
 ```
 
+### Run real VMs with Ignite
+
+[![asciicast](https://asciinema.org/a/HRrgSAjhc0gFGOCnjuqKDwIoN.svg)](https://asciinema.org/a/HRrgSAjhc0gFGOCnjuqKDwIoN)
+
 ## FAQ
 
 ### Is `footloose` just like LXD?
